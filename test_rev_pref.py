@@ -57,8 +57,7 @@ def plot_binned_ccei(binned_data, title, save_path=None):
 if __name__ == "__main__":
     path = "/Users/federicobassi/Desktop/TI.nosync/MPhil_Thesis/"
 
-    data_no_disposal = pd.read_excel(path + "/simulated_data/results_free_disposal.xlsx")
-    ccei_no_disposal = compute_ccei_distribution(data_no_disposal)
-    binned_no_disposal = bin_ccei_data(ccei_no_disposal)
-    print(binned_no_disposal)
-    plot_binned_ccei(binned_no_disposal, "CCEI distribution, no disposal", save_path= path+"/python_no_disposal.png")
+    data_free_disposal = pd.read_excel(path + "/simulated_data/results_free_disposal.xlsx")
+    ccei_free_disposal = compute_ccei_distribution(data_free_disposal)
+    binned_free_disposal = bin_ccei_data(ccei_free_disposal)
+    plot_binned_ccei(binned_free_disposal, "CCEI distribution, free disposal", save_path= path+"/python_no_disposal.png")

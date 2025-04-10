@@ -101,14 +101,17 @@ def plot_noise(df, utility_function, noise_sd, free_disposal=True, save=False, s
 if __name__ == '__main__':
     path = "/Users/federicobassi/Desktop/TI.nosync/MPhil_Thesis/simulated_data"
     img_path = "/Users/federicobassi/Desktop/TI.nosync/MPhil_Thesis/plots"
+    data = pd.read_excel(path+"/optimization_extended_budgets.xlsx", index_col=0)
     data_no_disposal = pd.read_excel(path + "/results_no_disposal.xlsx", index_col=0)
     data_free_disposal = pd.read_excel(path + "/results_free_disposal.xlsx", index_col=0)
 
     # EXECUTION
-    plot_static_budget_constraints(data_no_disposal, save=True, savepath=img_path)
+    plot_static_budget_constraints(data, save=True, savepath=img_path)
 
-    for noise in [12, 24, 48]:
+    """
+    for noise in [0, 2, 4, 6]:
         plot_noise(data_no_disposal, "CES", noise_sd=noise, free_disposal=False, save=False, savepath=img_path)
         plot_noise(data_free_disposal, "CES", noise_sd=noise, free_disposal=True, save=False, savepath=img_path)
 
     # plot_noise(data, "CES", noise_sd=10, save=False, savepath=img_path)
+    """

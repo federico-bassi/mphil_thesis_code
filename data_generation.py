@@ -42,29 +42,28 @@ def ces(x, y, alpha_ces=0.5, rho_ces=0):
         return 0
 
 
-
 def budget_constraint(max_self, max_other, x):
     """Defines the budget constraint given maximum resources."""
     return max_other - (max_other / max_self) * x
 
 
-def data_generation(budgets, utility_functions):
-    """Generates a DataFrame with budget constraints and utility functions.
-
+def data_generation(budgets, utility_funcs):
+    """
     Parameters:
-    budgets (list of tuples): List of (max_self, max_other) budget constraints.
-    utility_functions (list of tuples): List of (function, label) utility functions.
-
-    Returns:
-    pd.DataFrame: DataFrame containing budget constraints and corresponding utility functions.
+    - budgets: list of (max_self, max_other)
+    - utility_funcs: list of (func, param_dict, label)
+      e.g. [(ces, {'alpha_ces': 0.5, 'rho_ces': -10}, 'CES_1'), ...]
     """
     data = []
     ind = 1
     for max_self, max_other in budgets:
-        for func, label in utility_functions:
-            data.append((ind, max_self, max_other, func, label))
+        for func, param_dict, label in utility_funcs:
+            def utility_fixed(x, y, func=func, param_dict=param_dict):
+                return func(x, y, **param_dict)
+
+            data.append((ind, max_self, max_other, utility_fixed, label))
             ind += 1
-    return pd.DataFrame(data, columns=["id", "max_self", 'max_other', 'utility_func', 'utility_label'])
+    return pd.DataFrame(data, columns=["id", "max_self", "max_other", "utility_func", "utility_label"])
 
 
 def data_generation_random_parameters(budgets, utility_func, utility_label, param_distributions, n_samples=50):
@@ -121,16 +120,21 @@ def maximize_utility(df):
         cons = ({'type': 'ineq', 'fun': lambda z: budget_constraint(row['max_self'], row['max_other'], z[0]) - z[1]})
 
         # Use an interior point as starting value to avoid boundary issues
-        initial_guess = [row['max_self'] / 10, row['max_other'] / 10]
+        initial_guess = np.array([15, 15])
 
-        # Run constrained optimization
+        # Run constrained optimization with reasonable precision
         result = minimize(
             neg_utility,
             initial_guess,
             method="SLSQP",
             bounds=bounds,
             constraints=cons,
-            options={'ftol': 1e-9, 'maxiter': 10000}
+            options={
+                "ftol": 1e-6,
+                "eps": 1e-11,
+                'maxiter': 100000,
+                'disp': False
+            }
         )
 
         if result.success:
@@ -142,88 +146,118 @@ def maximize_utility(df):
                 float(result.x[1]),
                 row['utility_label']
             ))
+        else:
+            print(f"[WARNING] Optimization failed for ID {row['id']} with message: {result.message}")
 
     return pd.DataFrame(results, columns=["id", 'max_self', 'max_other', 'opt_x', 'opt_y', 'utility_label'])
 
 
 def maximize_utility_global(df):
-    """Optimizes utility functions using differential_evolution with linear budget constraints.
+    """Optimizes utility functions using differential_evolution with linear budget constraints,
+    then refines results with local SLSQP optimization."""
 
-    Parameters:
-    df (pd.DataFrame): DataFrame with budget constraints and utility functions.
-
-    Returns:
-    pd.DataFrame: DataFrame containing optimization results.
-    """
     results = []
 
     for _, row in df.iterrows():
-        print("Agent "+ str(row["id"]) +" is maximizing utility!")
+        print(f"Agent {row['id']} is maximizing utility!")
+
         max_self, max_other = row['max_self'], row['max_other']
 
-        # Objective function to minimize (negative utility)
+        # Objective: negative utility for minimization
         def neg_utility(z):
             return -row['utility_func'](z[0], z[1])
 
         # Bounds on x and y
         bounds = [(0, max_self), (0, max_other)]
 
-        # Budget constraint: y <= -(max_other/max_self)*x + max_other
+        # Constraint: y <= budget line
         slope = max_other / max_self if max_self != 0 else 0
-        constraint = LinearConstraint([[slope, 1]], -np.inf, max_other)
+        linear_constraint = LinearConstraint([[slope, 1]], -np.inf, max_other)
 
-        # Run global optimization
-        result = differential_evolution(
+        # Global optimization with DE
+        result_de = differential_evolution(
             neg_utility,
             bounds,
-            constraints=(constraint,),
+            constraints=(linear_constraint,),
             maxiter=10000,
-            tol=1e-9,
+            tol=1e-10,
+            popsize=25,
             polish=True,
-            seed=123
+            seed=123,
+            strategy='best1bin',
+            updating='deferred'
         )
+
+        # Local refinement with SLSQP
+        result_local = minimize(
+            neg_utility,
+            result_de.x,  # start from DE result
+            method="SLSQP",
+            bounds=bounds,
+            constraints={'type': 'ineq', 'fun': lambda z: budget_constraint(max_self, max_other, z[0]) - z[1]},
+            # options={'ftol': 1e-15, 'maxiter': 1000}
+        )
+
+        # Final choice: prefer local if successful, else fallback to DE
+        if result_local.success:
+            final_x, final_y = result_local.x
+            success = True
+        else:
+            final_x, final_y = result_de.x
+            success = result_de.success
 
         results.append((
             row["id"],
             max_self,
             max_other,
-            float(result.x[0]),
-            float(result.x[1]),
+            float(final_x),
+            float(final_y),
             row['utility_label'],
-            result.success
+            success
         ))
 
     return pd.DataFrame(results, columns=["id", 'max_self', 'max_other', 'opt_x', 'opt_y', 'utility_label', "success"])
 
 
 def add_noise(df, mean=0, std=5, free_disposal=True):
-    """Adds negative noise to optimal values while ensuring non-negativity.
+    """
+    Adds noise to optimal values. If free_disposal is True, noise is added
+    along the budget constraint only (tangent direction). Otherwise, noise
+    can move both along and inward from the budget line.
 
     Parameters:
-    df (pd.DataFrame): DataFrame containing optimized values.
-    mean (float): Mean of the normal distribution for noise.
-    std (float): Standard deviation of the normal distribution for noise.
-    free_disposal(boolean): Specifies how the noise should be added. If true, agent chooses a point in the interior,
-                            if false, agent is constrained on the budget set.
+    df (pd.DataFrame): Must contain 'opt_x', 'opt_y', 'max_self', and 'max_other'.
+    mean (float): Mean of the noise (not used).
+    std (float): Standard deviation of the noise.
+    free_disposal (bool): If True, noise moves only along budget line. Else, also inward.
 
     Returns:
-    pd.DataFrame: DataFrame with added 'noisy_x' and 'noisy_y' columns.
+    pd.DataFrame: With new columns 'noisy_x', 'noisy_y', and 'noise'.
     """
     df = df.copy()
-    if free_disposal:
-        noise_x = -np.abs(np.random.normal(mean, std, size=len(df)))
-        noise_y = -np.abs(np.random.normal(mean, std, size=len(df)))
-        df['noisy_x'] = np.where(df['opt_x'] > 0, df['opt_x'] + noise_x, df['opt_x'])
-        df['noisy_y'] = np.where(df['opt_y'] > 0, df['opt_y'] + noise_y, df['opt_y'])
-        df['noisy_x'] = df['noisy_x'].clip(lower=0)
-        df['noisy_y'] = df['noisy_y'].clip(lower=0)
-    else:
-        for index, row in df.iterrows():
-            m = row["max_other"]/row["max_self"]
-            dx = np.random.normal(0, std/np.sqrt(1 + m**2))
-            noisy_x = np.clip(row['opt_x'] + dx, 0, row["max_self"])
-            df.loc[index, "noisy_x"] = noisy_x
-            df.loc[index, "noisy_y"] = budget_constraint(row["max_self"], row["max_other"], noisy_x)
+
+    for index, row in df.iterrows():
+        opt_point = np.array([row['opt_x'], row['opt_y']])
+        max_self, max_other = row["max_self"], row["max_other"]
+
+        # Define orthogonal and tangent directions based on price vector
+        p1 = 1
+        p2 = max_self / max_other
+        orthogonal = np.array([p1, p2])
+        orthogonal /= np.linalg.norm(orthogonal)
+
+        tangent = np.array([-p2, p1])
+        tangent /= np.linalg.norm(tangent)
+
+        # Generate displacement
+        t = np.random.normal()
+        # only inward movement if not free_disposal
+        o = 0 if free_disposal else -abs(np.random.normal())
+        displacement = std * (t * tangent + o * orthogonal)
+
+        noisy_point = opt_point + displacement
+        df.loc[index, "noisy_x"] = max(float(noisy_point[0]), 0)
+        df.loc[index, "noisy_y"] = max(float(noisy_point[1]), 0)
 
     df["noise"] = std
     return df
@@ -263,24 +297,25 @@ if __name__ == '__main__':
     alpha_cd, beta_cd = 0.5, 0.5
     alpha_ces, rho_ces = 0.5, 0.1
     mean_noise, sd_noise = 0, 5
-    param_distribution_ces = {'alpha_ces': lambda: np.random.uniform(0.5, 0.7), 'rho_ces': lambda: np.random.uniform(0.2, 0.7)}
-    samples = 100
+    param_distribution_ces = {'alpha_ces': lambda: np.random.uniform(0.5, 0.9),
+                              'rho_ces': lambda: np.random.uniform(-10, 0.9)}
+    samples = 200
     path = "/Users/federicobassi/Desktop/TI.nosync/MPhil_Thesis/simulated_data"
 
     # Define budget constraints
-    andreoni_miller_budgets = [(120, 40), (40, 120), (120, 60), (60, 120), (150, 75), (75, 150), (60, 60), (100, 100), (80, 80), (160, 40), (40, 160)]
+    andreoni_miller_budgets = [(120, 40), (40, 120), (120, 60), (60, 120), (150, 75),
+                               (75, 150), (60, 60), (100, 100), (80, 80), (160, 40), (40, 160)]
 
     new_budgets = [(120, 40), (40, 120), (120, 60), (60, 120), (150, 75), (75, 150), (60, 60), (100, 100),
-                   (80, 80), (160, 40), (40, 160), (50, 10), (10, 50), (12, 10), (10, 12), (8, 16), (16,8),
-                   (100, 80), (80,100), (40, 200), (200, 40), (20, 160), (160, 20), (35, 35)]
+                   (80, 80), (160, 40), (40, 160),
+                   (120, 120), (100, 150), (150, 100), (40, 40), (30, 60), (60, 30), (50,50), (30, 150), (150,30)]
 
     # Define utility functions with parameterized lambda functions
-    utility_functions = [
-        (lambda x, y: fehr_schmidt_utility(x, y, alpha=alpha_fs, beta=beta_fs), "FS"),
-        (lambda x, y: altruistic_utility(x, y, theta=altruism_parameter), "A"),
-        (lambda x, y: selfish_utility(x, y), "S"),
-        (lambda x, y: cobb_douglas(x, y, alpha=alpha_cd, beta=beta_cd), "CD"),
-        (lambda x, y: ces(x, y, alpha_ces=alpha_ces, rho_ces=rho_ces), "CES")
+    utility_funcs = [
+        (ces, {'alpha_ces': 0.5, 'rho_ces': -0.5}, "CES (α=0.5, ρ=-0.5)"),
+        (ces, {'alpha_ces': 0.9, 'rho_ces': -0.5}, "CES (α=0.9, ρ=-0.5)"),
+        (ces, {'alpha_ces': 0.5, 'rho_ces': 0.5}, "CES (α=0.5, ρ=0.5)"),
+        (ces, {'alpha_ces': 0.9, 'rho_ces': 0.5}, "CES (α=0.9, ρ=0.5)"),
     ]
 
     # Generate data
@@ -289,17 +324,19 @@ if __name__ == '__main__':
                                                                param_distributions=param_distribution_ces,
                                                                n_samples=samples)
 
+    # df_budgets_utility = data_generation(budgets=andreoni_miller_budgets, utility_funcs=utility_funcs)
+
     # Perform optimization
-    opt_results = maximize_utility_global(df_budgets_utility_ces)
-    opt_results.to_excel(path+"/optimization.xlsx")
+    opt_results = maximize_utility(df_budgets_utility_ces)
+    opt_results.to_excel(path + "/optimization_extended_budgets.xlsx")
 
     # Compute the standard deviations
-    #dict_std = compute_std(df=opt_results, budget_constraints=andreoni_miller_budgets)
-    #print(dict_std)
+    # dict_std = compute_std(df=opt_results, budget_constraints=andreoni_miller_budgets)
+    # print(dict_std)
 
     # Add noise
-    opt_results = pd.read_excel(path+"/optimization.xlsx")
-    std_interval = [0, 2, 4, 6]
+    opt_results = pd.read_excel(path + "/optimization_extended_budgets.xlsx")
+    std_interval = [0, 1, 2, 3, 5, 10]
     noisy_data_no_disposal = pd.DataFrame()
     noisy_data_free_disposal = pd.DataFrame()
     for sd_noise in std_interval:
